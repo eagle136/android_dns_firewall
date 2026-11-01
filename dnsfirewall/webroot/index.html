@@ -1,0 +1,903 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DNS 防火墙</title>
+<script>
+/* 先定主题再渲染，避免闪白 */
+(function () {
+  var t = null;
+  try { t = localStorage.getItem('dnsfw-theme'); } catch (e) {}
+  if (t !== 'light' && t !== 'dark') {
+    t = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+<style>
+:root {
+  --bg: #f2f4f7;
+  --panel: #ffffff;
+  --panel-2: #f7f8fa;
+  --text: #16181d;
+  --muted: #6b7280;
+  --border: #e2e5ea;
+  --primary: #2f6fed;
+  --primary-ink: #ffffff;
+  --danger: #e5484d;
+  --success: #16a34a;
+  --radius: 12px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 4px 16px rgba(16, 24, 40, .05);
+}
+html[data-theme="dark"] {
+  --bg: #000000;
+  --panel: #0c0d0f;
+  --panel-2: #111214;
+  --text: #ffffff;
+  --muted: #9ca3af;
+  --border: #232529;
+  --primary: #4f8cff;
+  --primary-ink: #ffffff;
+  --danger: #ff5a5f;
+  --success: #22c55e;
+  --shadow: none;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  min-height: 100vh;
+  padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.wrap { max-width: 680px; margin: 0 auto; padding: 16px 14px 28px; }
+header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 2px 14px;
+}
+header .titles { flex: 1; min-width: 0; }
+header h1 { margin: 0; font-size: 19px; letter-spacing: .2px; }
+header .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+.icon-btn {
+  flex: none;
+  height: 34px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 9px;
+  background: var(--panel); color: var(--text);
+  font-size: 13px; cursor: pointer;
+}
+.icon-btn:active { transform: scale(.97); }
+
+.banner {
+  display: none;
+  margin: 0 0 12px; padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-left: 3px solid var(--danger);
+  border-radius: 10px; background: var(--panel);
+  color: var(--text); font-size: 13px;
+}
+.banner.show { display: block; }
+
+.tabs {
+  display: flex; gap: 6px;
+  padding: 4px; margin: 0 0 12px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.tab {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  padding: 9px 5px; border: 0; border-radius: 9px;
+  background: transparent; color: var(--muted);
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  white-space: nowrap;
+}
+.tab.active { background: var(--panel-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+.tab .count {
+  min-width: 16px; padding: 0 4px;
+  border-radius: 999px; background: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary); font-size: 11px; line-height: 18px; text-align: center;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.card + .card { margin-top: 12px; }
+
+.add {
+  display: flex; gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.add input {
+  flex: 1; min-width: 0;
+  height: 40px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel); color: var(--text);
+  font: inherit; font-size: 14px;
+  outline: none;
+}
+.add input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 18%, transparent); }
+.btn {
+  height: 40px; padding: 0 16px;
+  border: 0; border-radius: 10px;
+  font: inherit; font-weight: 700; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+}
+.btn.primary { background: var(--primary); color: var(--primary-ink); }
+.btn:disabled { opacity: .55; cursor: default; }
+.btn:active:not(:disabled) { transform: scale(.98); }
+
+.hint { margin: 0; padding: 9px 12px; color: var(--muted); font-size: 12.5px; border-bottom: 1px solid var(--border); }
+.error { display: none; margin: 0; padding: 9px 12px; color: var(--danger); font-size: 13px; border-bottom: 1px solid var(--border); }
+.error.show { display: block; }
+
+ul.list { list-style: none; margin: 0; padding: 0; }
+ul.list li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+}
+ul.list li:last-child { border-bottom: 0; }
+ul.list .name {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+ul.list .del {
+  flex: none;
+  height: 30px; padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: 8px;
+  background: transparent; color: var(--danger);
+  font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+ul.list .del:active { transform: scale(.97); }
+.empty { padding: 26px 12px; text-align: center; color: var(--muted); font-size: 13px; }
+.loading { padding: 26px 12px; text-align: center; color: var(--muted); font-size: 13px; }
+
+.foot {
+  margin: 14px 2px 0;
+  color: var(--muted); font-size: 12px;
+  line-height: 1.65; overflow-wrap: anywhere;
+}
+.foot code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--success); margin-right: 6px; vertical-align: 1px; }
+.dot.off { background: var(--muted); }
+
+.foot-actions { display: flex; gap: 8px; margin: 12px 2px 0; }
+.btn.ghost { flex: 1; height: 38px; font-size: 13.5px; background: var(--panel); border: 1px solid var(--border); color: var(--text); }
+.btn.ghost.danger { border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); color: var(--danger); }
+.btn.ghost.good { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); color: var(--success); }
+
+.modal {
+  position: fixed; inset: 0; z-index: 30;
+  display: none; align-items: center; justify-content: center;
+  padding: 16px; background: rgba(0, 0, 0, .55);
+}
+.modal.show { display: flex; }
+.modal-card {
+  display: flex; flex-direction: column;
+  width: 100%; max-width: 560px; max-height: 80vh;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px 9px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.modal-head strong { flex: 1; font-size: 14.5px; }
+.modal-body { flex: 1; min-height: 0; overflow: auto; }
+.modal-body pre {
+  margin: 0; padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px; line-height: 1.6;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.modal-note { margin: 0; padding: 8px 12px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.modal-card.confirm { max-width: 360px; }
+.confirm-text { margin: 0; padding: 14px 14px 2px; font-size: 13.5px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
+.confirm-actions { display: flex; gap: 8px; padding: 12px 14px 14px; }
+.confirm-actions .btn { flex: 1; height: 38px; font-size: 13.5px; }
+
+.toast {
+  position: fixed; left: 50%; bottom: 26px;
+  transform: translate(-50%, 16px);
+  max-width: calc(100vw - 40px);
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--text); color: var(--bg);
+  font-size: 13px; font-weight: 600;
+  opacity: 0; pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+  z-index: 20;
+}
+.toast.show { opacity: .96; transform: translate(-50%, 0); }
+.toast.err { background: var(--danger); color: #fff; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="titles">
+      <h1>DNS 防火墙</h1>
+      <p class="sub">名单管理 · 保存即热加载</p>
+    </div>
+    <button class="icon-btn" id="refreshBtn" type="button">刷新</button>
+    <button class="icon-btn" id="themeBtn" type="button">深色</button>
+  </header>
+
+  <div class="banner" id="envBanner">
+    未检测到 KernelSU WebUI 环境。请从 KernelSU 管理器里打开本模块的 WebUI；普通浏览器无法读写配置。
+  </div>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab active" type="button" role="tab" data-kind="blocklist">黑名单<span class="count" id="count-blocklist">0</span></button>
+    <button class="tab" type="button" role="tab" data-kind="whitelist">白名单<span class="count" id="count-whitelist">0</span></button>
+    <button class="tab" type="button" role="tab" data-kind="upstream">DNS服务器<span class="count" id="count-upstream">0</span></button>
+  </nav>
+
+  <section class="card">
+    <form class="add" id="addForm" autocomplete="off">
+      <input id="entryInput" type="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="example.com">
+      <button class="btn primary" id="addBtn" type="submit">添加</button>
+    </form>
+    <p class="hint" id="hint"></p>
+    <p class="error" id="formError"></p>
+    <div id="listBox"><div class="loading">读取中…</div></div>
+  </section>
+
+  <p class="foot">
+    <span class="dot" id="statusDot"></span><span id="statusText">正在连接…</span><br>
+    配置目录 <code id="confDir">—</code>
+  </p>
+
+  <div class="foot-actions">
+    <button class="btn ghost" id="logBtn" type="button">查询解析记录</button>
+    <button class="btn ghost danger" id="logToggle" type="button" disabled>关闭记录</button>
+  </div>
+  <div class="foot-actions">
+    <button class="btn ghost" id="exportBtn" type="button">备份配置</button>
+    <button class="btn ghost" id="importBtn" type="button">还原配置</button>
+  </div>
+</div>
+
+<div class="modal" id="logModal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong>查询解析记录</strong>
+      <button class="icon-btn" id="logRefresh" type="button">刷新</button>
+      <button class="icon-btn" id="logClose" type="button">关闭</button>
+    </div>
+    <div class="modal-body"><pre id="logText">读取中…</pre></div>
+    <p class="modal-note" id="logNote">—</p>
+  </div>
+</div>
+
+<div class="modal" id="confirmModal">
+  <div class="modal-card confirm">
+    <div class="modal-head"><strong id="confirmTitle">确认</strong></div>
+    <p class="confirm-text" id="confirmText">—</p>
+    <div class="confirm-actions">
+      <button class="btn ghost" id="confirmCancel" type="button">取消</button>
+      <button class="btn primary" id="confirmOk" type="button">确定</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var CONF_DIR = '/data/adb/modules/dnsfirewall/files/conf';
+  var QLOG_PATH = '/data/adb/modules/dnsfirewall/dnsfw_queries.log';
+  var QLOG_SWITCH = CONF_DIR + '/qlog.off';
+  var BACKUP_PATH = '/sdcard/Download/dnsfirewall-backup.tar';
+  var RESTORE_DIR = '/data/local/tmp/dnsfw-restore';
+  var KINDS = {
+    blocklist: {
+      file: 'blocklist.txt', label: '黑名单', type: 'domain', strict: true,
+      placeholder: 'example.com 或 *.example.com',
+      hint: '命中后拦截（A 查询回 127.0.0.1，其它类型回 NXDOMAIN）；白名单可豁免。'
+    },
+    whitelist: {
+      file: 'whitelist.txt', label: '白名单', type: 'domain', strict: false,
+      placeholder: 'api.example.com',
+      hint: '只豁免黑名单命中项，不单独放行任何域名。'
+    },
+    upstream: {
+      file: 'upstream.txt', label: 'DNS服务器', type: 'upstream', strict: false,
+      placeholder: '223.5.5.5 或 223.5.5.5#5353',
+      hint: '每行一个 IPv4/IPv6，可带 #端口；最多 16 个，按顺序使用。'
+    }
+  };
+
+  var state = {
+    current: 'blocklist',
+    files: {
+      blocklist: { lines: [], entries: [], loaded: false, error: '' },
+      whitelist: { lines: [], entries: [], loaded: false, error: '' },
+      upstream: { lines: [], entries: [], loaded: false, error: '' }
+    },
+    saving: false,
+    logEnabled: null
+  };
+
+  var el = {
+    tabs: document.getElementById('tabs'),
+    input: document.getElementById('entryInput'),
+    addForm: document.getElementById('addForm'),
+    addBtn: document.getElementById('addBtn'),
+    hint: document.getElementById('hint'),
+    formError: document.getElementById('formError'),
+    listBox: document.getElementById('listBox'),
+    themeBtn: document.getElementById('themeBtn'),
+    refreshBtn: document.getElementById('refreshBtn'),
+    banner: document.getElementById('envBanner'),
+    statusDot: document.getElementById('statusDot'),
+    statusText: document.getElementById('statusText'),
+    confDir: document.getElementById('confDir'),
+    toast: document.getElementById('toast'),
+    logBtn: document.getElementById('logBtn'),
+    logToggle: document.getElementById('logToggle'),
+    logModal: document.getElementById('logModal'),
+    logText: document.getElementById('logText'),
+    logNote: document.getElementById('logNote'),
+    logRefresh: document.getElementById('logRefresh'),
+    logClose: document.getElementById('logClose'),
+    exportBtn: document.getElementById('exportBtn'),
+    importBtn: document.getElementById('importBtn'),
+    confirmModal: document.getElementById('confirmModal'),
+    confirmTitle: document.getElementById('confirmTitle'),
+    confirmText: document.getElementById('confirmText'),
+    confirmOk: document.getElementById('confirmOk'),
+    confirmCancel: document.getElementById('confirmCancel')
+  };
+
+  el.confDir.textContent = CONF_DIR;
+
+  /* ---------- 主题 ---------- */
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    el.themeBtn.textContent = t === 'dark' ? '浅色' : '深色';
+  }
+  applyTheme(document.documentElement.getAttribute('data-theme') || 'light');
+  el.themeBtn.addEventListener('click', function () {
+    var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    try { localStorage.setItem('dnsfw-theme', next); } catch (e) {}
+  });
+
+  /* ---------- ksu.exec 封装 ---------- */
+  function hasKsu() {
+    return !!(window.ksu && typeof window.ksu.exec === 'function');
+  }
+
+  function exec(cmd) {
+    return new Promise(function (resolve, reject) {
+      if (!hasKsu()) { reject(new Error('NO_KSU')); return; }
+      var name = 'dnsfw_cb_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      var done = false, timer = null;
+      function finish(errno, stdout, stderr) {
+        if (done) return;
+        done = true;
+        if (timer) clearTimeout(timer);
+        try { delete window[name]; } catch (e) { window[name] = undefined; }
+        if (Number(errno) === 0) resolve(String(stdout == null ? '' : stdout));
+        else reject(new Error(String(stderr || ('命令失败（' + errno + '）'))));
+      }
+      window[name] = finish;
+      timer = setTimeout(function () { finish(124, '', '命令执行超时'); }, 8000);
+      try {
+        var ret = window.ksu.exec(cmd, '{}', name);
+        if (ret && typeof ret.then === 'function') {
+          ret.then(function (out) { finish(0, typeof out === 'string' ? out : (out && out.stdout) || ''); },
+                   function (e) { finish(1, '', String(e && e.message || e)); });
+        }
+      } catch (e) {
+        finish(1, '', String(e && e.message || e));
+      }
+    });
+  }
+
+  /* ---------- 文件读写 ---------- */
+  function splitLines(text) {
+    if (!text) return [];
+    return String(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  }
+  function joinLines(lines) {
+    return lines.length ? lines.join('\n') + '\n' : '';
+  }
+  function isEntry(line) {
+    var t = line.trim();
+    return t !== '' && t.charAt(0) !== '#';
+  }
+  function entryIndexes(lines) {
+    var out = [];
+    for (var i = 0; i < lines.length; i++) if (isEntry(lines[i])) out.push(i);
+    return out;
+  }
+
+  function encBytes(text) {
+    return new TextEncoder().encode(text);
+  }
+
+  function b64ToBytes(b64) {
+    var bin = atob(b64.replace(/\s+/g, ''));
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  function bytesToText(bytes) {
+    try { return new TextDecoder('utf-8').decode(bytes); } catch (e) {}
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return decodeURIComponent(escape(bin));
+  }
+
+  async function readConf(kind) {
+    var path = CONF_DIR + '/' + KINDS[kind].file;
+    /* ksu.exec 回传 stdout 时会吃掉末尾换行（cat 1108 字节只能拿回 1107），
+       直接按文本对字节数必然误报；部分 su 实现还会把退出码抹成 0，不能靠 errno 判缺失。
+       所以一条命令只认 stdout：MISSING，或 OK <字节数> <整文件 base64>。 */
+    var out;
+    try {
+      out = await exec("if [ -f '" + path + "' ]; then printf '%s' 'OK '; wc -c < '" + path +
+        "' | tr -d '\\n'; printf ' '; base64 -w0 '" + path + "' 2>/dev/null || base64 '" + path +
+        "' 2>/dev/null | tr -d '\\n'; else printf '%s' 'MISSING'; fi");
+    } catch (e) {
+      if (e && e.message === 'NO_KSU') throw e;
+      throw new Error('读取失败：' + (e && e.message ? e.message : e));
+    }
+    if (out === 'MISSING') return ''; /* 文件不存在 = 空名单 */
+    var m = /^OK (\d+) ([A-Za-z0-9+/=]*)$/.exec(out);
+    if (!m) throw new Error('读取失败（输出无法解析），为避免覆盖已停止编辑');
+    var size = parseInt(m[1], 10);
+    var bytes;
+    try { bytes = b64ToBytes(m[2]); } catch (e) {
+      throw new Error('配置解码失败，为避免覆盖已停止编辑');
+    }
+    if (size !== bytes.length) {
+      throw new Error('读取不完整（' + bytes.length + '/' + size + ' 字节），为避免覆盖已停止编辑');
+    }
+    return bytesToText(bytes);
+  }
+
+  function b64utf8(text) {
+    var bytes = encBytes(text);
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+
+  async function writeConf(kind, lines) {
+    var path = CONF_DIR + '/' + KINDS[kind].file;
+    var tmp = path + '.tmp';
+    var text = joinLines(lines);
+    var want = encBytes(text).length;
+    var b64 = b64utf8(text);
+    var CHUNK = 1200; /* 4 的倍数: 每条 base64 命令解出的字节可独立追加 */
+    try {
+      if (b64.length <= CHUNK) {
+        await exec("printf '%s' '" + b64 + "' | base64 -d > '" + tmp + "'");
+      } else {
+        await exec(": > '" + tmp + "'");
+        for (var i = 0; i < b64.length; i += CHUNK) {
+          await exec("printf '%s' '" + b64.slice(i, i + CHUNK) + "' | base64 -d >> '" + tmp + "'");
+        }
+      }
+      /* 写临时文件 → 核对字节数 → 原子 rename：dnsfw 的 inotify 只认最终文件名，
+         失败时原文件保持不动，也不会被读到半截内容 */
+      await exec("[ \"$(wc -c < '" + tmp + "')\" -eq " + want + " ] && chmod 644 '" + tmp +
+                 "' && mv -f '" + tmp + "' '" + path + "' || { rm -f '" + tmp + "'; exit 1; }");
+    } catch (e) {
+      try { await exec("rm -f '" + tmp + "'"); } catch (e2) {}
+      throw e;
+    }
+  }
+
+  /* ---------- 校验（镜像 dnsfw 的规则，提前给提示） ---------- */
+  function checkDomain(v, strict) {
+    var s = v.toLowerCase().replace(/^\.+/, '').replace(/\.+$/, '');
+    if (!s) return '不能为空';
+    if (!/^[a-z0-9._*-]+$/.test(s)) return '只能包含字母、数字、-、_、.、*';
+    if (s.length > 253) return '整串不能超过 253 字节';
+    var labels = s.split('.');
+    for (var i = 0; i < labels.length; i++) {
+      if (!labels[i] || labels[i].length > 63) return '每个标签必须 1..63 字节';
+    }
+    if (strict) {
+      if (s.indexOf('.') < 0) return '黑名单不接受无点单标签（会拦掉整个 TLD）';
+      if (s.slice(0, 2) === '*.' && s.slice(2).indexOf('.') < 0) return '不接受 *.com 这种 TLD 通配';
+      if (/^\*+$/.test(s)) return '纯 * 会匹配所有域名';
+    }
+    return '';
+  }
+
+  function isIPv4(s) {
+    var m = s.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!m) return false;
+    for (var i = 1; i <= 4; i++) if (Number(m[i]) > 255) return false;
+    return true;
+  }
+  function isIPv6(s) {
+    if (!/^[0-9a-fA-F:.]+$/.test(s) || s.indexOf(':') < 0) return false;
+    var z = s.split('::');
+    if (z.length > 2) return false;
+    return true;
+  }
+  function checkUpstream(v) {
+    var h = v.indexOf('#');
+    var addr = h < 0 ? v : v.slice(0, h);
+    var port = h < 0 ? null : v.slice(h + 1);
+    if (!addr) return '缺少 IP 地址';
+    if (port !== null && !/^\d+$/.test(port)) return '端口必须是数字';
+    if (port !== null && (Number(port) < 1 || Number(port) > 65535)) return '端口必须在 1..65535';
+    if (!isIPv4(addr) && !isIPv6(addr)) return '需要合法的 IPv4 或 IPv6 地址';
+    return '';
+  }
+
+  function validate(kind, value) {
+    var cfg = KINDS[kind];
+    var v = value.trim();
+    if (!v) return '不能为空';
+    return cfg.type === 'upstream' ? checkUpstream(v) : checkDomain(v, cfg.strict);
+  }
+
+  /* ---------- 渲染 ---------- */
+  function toast(msg, isErr) {
+    el.toast.textContent = msg;
+    el.toast.className = 'toast show' + (isErr ? ' err' : '');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { el.toast.className = 'toast'; }, 2200);
+  }
+
+  function showError(msg) {
+    el.formError.textContent = msg || '';
+    el.formError.className = 'error' + (msg ? ' show' : '');
+  }
+
+  function setStatus(ok, text) {
+    el.statusDot.className = 'dot' + (ok ? '' : ' off');
+    el.statusText.textContent = text;
+  }
+
+  function updateTabs() {
+    Object.keys(KINDS).forEach(function (k) {
+      document.getElementById('count-' + k).textContent = state.files[k].entries.length;
+    });
+  }
+
+  function render() {
+    var kind = state.current;
+    var cfg = KINDS[kind];
+    var st = state.files[kind];
+    el.input.placeholder = cfg.placeholder;
+    el.hint.textContent = cfg.hint;
+    el.input.disabled = !!st.error;
+    el.addBtn.disabled = !!st.error || state.saving;
+    if (st.error) showError('读取失败：' + st.error + '（本页只读）');
+    updateTabs();
+
+    document.querySelectorAll('.tab').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-kind') === kind);
+    });
+
+    el.listBox.textContent = '';
+    if (!st.loaded) {
+      var d = document.createElement('div');
+      d.className = 'loading';
+      d.textContent = '读取中…';
+      el.listBox.appendChild(d);
+      return;
+    }
+    if (st.error) {
+      var er = document.createElement('div');
+      er.className = 'empty';
+      er.textContent = '读取失败，本页暂不写入';
+      el.listBox.appendChild(er);
+      return;
+    }
+    if (!st.entries.length) {
+      var e = document.createElement('div');
+      e.className = 'empty';
+      e.textContent = cfg.label + '还没有条目';
+      el.listBox.appendChild(e);
+      return;
+    }
+    var ul = document.createElement('ul');
+    ul.className = 'list';
+    st.entries.forEach(function (lineIdx, n) {
+      var li = document.createElement('li');
+      var name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = st.lines[lineIdx].trim();
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'del';
+      del.textContent = '删除';
+      del.addEventListener('click', function () { removeEntry(kind, lineIdx, del); });
+      li.appendChild(name);
+      li.appendChild(del);
+      ul.appendChild(li);
+    });
+    el.listBox.appendChild(ul);
+  }
+
+  /* ---------- 数据操作 ---------- */
+  async function load(kind) {
+    var text = await readConf(kind);
+    var lines = splitLines(text);
+    state.files[kind].lines = lines;
+    state.files[kind].entries = entryIndexes(lines);
+    state.files[kind].loaded = true;
+    state.files[kind].error = '';
+  }
+
+  async function refreshAll(quiet) {
+    if (!hasKsu()) {
+      el.banner.classList.add('show');
+      setStatus(false, '未连接 KernelSU WebUI');
+      render();
+      if (!quiet) toast('请从 KernelSU 管理器的 WebUI 打开', true);
+      return;
+    }
+    el.banner.classList.remove('show');
+    el.refreshBtn.disabled = true;
+    try {
+      await Promise.all(Object.keys(KINDS).map(function (k) {
+        return load(k).catch(function (e) {
+          state.files[k].loaded = true;
+          if (e && e.message !== 'NO_KSU') state.files[k].error = e.message || '读取失败';
+        });
+      }));
+      var anyErr = Object.keys(KINDS).some(function (k) { return !!state.files[k].error; });
+      setStatus(!anyErr, anyErr ? '部分文件读取失败，相关页已锁定' : '已连接 · 配置目录可读');
+      render();
+      if (!quiet) toast('已刷新');
+    } finally {
+      el.refreshBtn.disabled = false;
+    }
+    loadLogState();
+  }
+
+  /* ---------- 解析记录 ---------- */
+  function renderLogToggle() {
+    if (state.logEnabled === null) return;
+    el.logToggle.disabled = false;
+    el.logToggle.textContent = state.logEnabled ? '关闭记录' : '开启记录';
+    el.logToggle.className = 'btn ghost ' + (state.logEnabled ? 'danger' : 'good');
+  }
+
+  async function loadLogState() {
+    if (!hasKsu()) { el.logToggle.disabled = true; return; }
+    try {
+      var s = await exec("if [ -f '" + QLOG_SWITCH + "' ]; then printf off; else printf on; fi");
+      state.logEnabled = s.trim() !== 'off';
+      renderLogToggle();
+    } catch (e) {
+      state.logEnabled = null;
+      el.logToggle.disabled = true;
+    }
+  }
+
+  async function loadLog() {
+    el.logText.textContent = '读取中…';
+    el.logNote.textContent = '—';
+    if (!hasKsu()) { el.logText.textContent = '未检测到 KernelSU WebUI 环境'; return; }
+    try {
+      var out = await exec("if [ -f '" + QLOG_PATH + "' ]; then printf 'OK '; wc -l < '" +
+        QLOG_PATH + "' | tr -d '\\n'; printf '\\n'; tail -n 400 '" + QLOG_PATH +
+        "'; else printf '%s' '@@MISSING@@'; fi");
+      if (out === '@@MISSING@@') {
+        el.logText.textContent = '暂无解析记录（文件不存在）';
+        el.logNote.textContent = QLOG_PATH;
+        return;
+      }
+      var nl = out.indexOf('\n');
+      var head = nl < 0 ? out : out.slice(0, nl);
+      if (head.indexOf('OK ') !== 0) throw new Error('输出无法解析');
+      var total = parseInt(head.slice(3), 10);
+      var body = nl < 0 ? '' : out.slice(nl + 1);
+      var lines = body.split('\n').filter(function (l) {
+        return l.trim() !== '' && l.charAt(0) !== '#';
+      });
+      el.logText.textContent = lines.length ? lines.join('\n') : '（暂无记录）';
+      el.logNote.textContent = QLOG_PATH + ' · 共 ' + (isFinite(total) ? total : '?') +
+        ' 行，显示最近 ' + Math.min(400, lines.length) + ' 条（重复域名只留一份）' +
+        (state.logEnabled === false ? ' · 记录已关闭' : '');
+    } catch (e) {
+      el.logText.textContent = '读取失败：' + (e && e.message || e);
+      el.logNote.textContent = QLOG_PATH;
+    }
+  }
+
+  function closeLog() { el.logModal.classList.remove('show'); }
+
+  el.logBtn.addEventListener('click', function () {
+    el.logModal.classList.add('show');
+    loadLog();
+  });
+  el.logRefresh.addEventListener('click', loadLog);
+  el.logClose.addEventListener('click', closeLog);
+  el.logModal.addEventListener('click', function (ev) {
+    if (ev.target === el.logModal) closeLog();
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') { closeLog(); closeConfirm(); }
+  });
+
+  el.logToggle.addEventListener('click', async function () {
+    if (state.logEnabled === null || el.logToggle.disabled) return;
+    var on = state.logEnabled;
+    el.logToggle.disabled = true;
+    try {
+      await exec(on ? "printf 'off\\n' > '" + QLOG_SWITCH + "'" : "rm -f '" + QLOG_SWITCH + "'");
+      state.logEnabled = !on;
+      renderLogToggle();
+      toast(on ? '已关闭解析记录' : '已开启解析记录');
+      if (el.logModal.classList.contains('show')) loadLog();
+    } catch (e) {
+      toast('操作失败：' + (e && e.message || e), true);
+      renderLogToggle();
+    }
+  });
+
+  /* ---------- 备份 / 还原 ---------- */
+  var confirmHandler = null;
+
+  function askConfirm(title, text, fn) {
+    el.confirmTitle.textContent = title;
+    el.confirmText.textContent = text;
+    confirmHandler = fn;
+    el.confirmOk.disabled = false;
+    el.confirmCancel.disabled = false;
+    el.confirmModal.classList.add('show');
+  }
+
+  function closeConfirm() {
+    el.confirmModal.classList.remove('show');
+    confirmHandler = null;
+  }
+
+  async function backupConf() {
+    var cmd = "if mkdir -p '/sdcard/Download' && tar -cf '" + BACKUP_PATH + "' -C '" + CONF_DIR +
+      "' blocklist.txt whitelist.txt upstream.txt; then printf 'OK '; wc -c < '" + BACKUP_PATH +
+      "' | tr -d '\\n'; else printf 'FAIL'; fi";
+    try {
+      var out = await exec(cmd);
+      if (out.indexOf('OK ') === 0) toast('已备份到 ' + BACKUP_PATH + '（' + out.slice(3) + ' 字节）');
+      else toast('备份失败', true);
+    } catch (e) {
+      toast('备份失败：' + (e && e.message || e), true);
+    }
+  }
+
+  async function restoreConf() {
+    var cmd = "if [ ! -f '" + BACKUP_PATH + "' ]; then printf 'MISSING'; else rm -rf '" + RESTORE_DIR +
+      "'; mkdir -p '" + RESTORE_DIR + "'; if tar -xf '" + BACKUP_PATH + "' -C '" + RESTORE_DIR +
+      "' blocklist.txt whitelist.txt upstream.txt && [ -f '" + RESTORE_DIR + "/blocklist.txt' ] && [ -f '" +
+      RESTORE_DIR + "/whitelist.txt' ] && [ -f '" + RESTORE_DIR + "/upstream.txt' ]; then ok=1; " +
+      "for f in blocklist.txt whitelist.txt upstream.txt; do cp \"" + RESTORE_DIR + "/$f\" \"" +
+      CONF_DIR + "/$f.tmp\" && chmod 644 \"" + CONF_DIR + "/$f.tmp\" && mv -f \"" + CONF_DIR +
+      "/$f.tmp\" \"" + CONF_DIR + "/$f\" || ok=0; done; if [ \"$ok\" = 1 ]; then printf 'OK'; " +
+      "else printf 'COPYFAIL'; fi; else printf 'BAD'; fi; fi";
+    try {
+      var out = await exec(cmd);
+      if (out === 'OK') {
+        toast('已还原，正在热加载');
+        refreshAll(true);
+      } else if (out === 'MISSING') {
+        toast('备份文件不存在：' + BACKUP_PATH, true);
+      } else if (out === 'COPYFAIL') {
+        toast('还原失败：写入配置出错', true);
+      } else {
+        toast('还原失败：备份文件无法读取', true);
+      }
+    } catch (e) {
+      toast('还原失败：' + (e && e.message || e), true);
+    }
+  }
+
+  el.exportBtn.addEventListener('click', function () {
+    askConfirm('备份配置', '将当前黑名单、白名单、DNS服务器打包写入：\n' + BACKUP_PATH +
+      '\n同名文件会被直接覆盖。', backupConf);
+  });
+  el.importBtn.addEventListener('click', function () {
+    askConfirm('还原配置', '将用备份文件覆盖当前三个配置，约 0.2 秒后生效：\n' + BACKUP_PATH, restoreConf);
+  });
+  el.confirmCancel.addEventListener('click', closeConfirm);
+  el.confirmModal.addEventListener('click', function (ev) {
+    if (ev.target === el.confirmModal) closeConfirm();
+  });
+  el.confirmOk.addEventListener('click', async function () {
+    var fn = confirmHandler;
+    if (!fn) return;
+    el.confirmOk.disabled = true;
+    el.confirmCancel.disabled = true;
+    try { await fn(); } finally { closeConfirm(); }
+  });
+
+  async function save(kind, lines) {
+    if (state.saving || state.files[kind].error) return;
+    state.saving = true;
+    el.addBtn.disabled = true;
+    el.addBtn.textContent = '保存中…';
+    showError('');
+    try {
+      await writeConf(kind, lines);
+      state.files[kind].lines = lines;
+      state.files[kind].entries = entryIndexes(lines);
+      state.files[kind].loaded = true;
+      state.files[kind].error = '';
+      render();
+      toast('已保存，正在热加载');
+    } catch (e) {
+      showError('写入失败：' + (e && e.message || e));
+      toast('写入失败', true);
+    } finally {
+      state.saving = false;
+      el.addBtn.textContent = '添加';
+      el.addBtn.disabled = !!state.files[kind].error;
+    }
+  }
+
+  el.addForm.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var kind = state.current;
+    if (state.saving || state.files[kind].error) return;
+    var value = el.input.value.trim();
+    var err = validate(kind, value);
+    if (err) { showError(err); el.input.focus(); return; }
+    var st = state.files[kind];
+    var lines = st.lines.slice();
+    if (lines.length && lines[lines.length - 1] === '') lines.pop();
+    lines.push(value);
+    el.input.value = '';
+    save(kind, lines);
+  });
+
+  function removeEntry(kind, lineIdx, btn) {
+    if (state.saving || state.files[kind].error) return;
+    var st = state.files[kind];
+    var lines = st.lines.slice();
+    lines.splice(lineIdx, 1);
+    if (btn) btn.disabled = true;
+    save(kind, lines);
+  }
+
+  el.tabs.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('.tab') : null;
+    if (!b) return;
+    var kind = b.getAttribute('data-kind');
+    if (!KINDS[kind] || kind === state.current) return;
+    state.current = kind;
+    showError('');
+    el.input.value = '';
+    render();
+  });
+
+  el.refreshBtn.addEventListener('click', function () { refreshAll(false); });
+
+  render();
+  refreshAll(true);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# 打包产物与本地备份
+output/
+backup/
+
+# 编译中间产物（files/bin/dnsfw 是模块要用的产物，保留在仓库里）
+dnsfirewall/files/src/dnsfw
+dnsfirewall/files/src/dnsfw_a64
+dnsfirewall/files/src/dnsfw_arm
+dnsfirewall/files/src/dnsfw_O0
+dnsfirewall/files/src/dnsfw_id
+dnsfirewall/files/src/dnsfw_id.c
+*.o
+__pycache__/
+*.pyc
+
+# 运行期日志
+*.log
+
+# 系统垃圾
+.DS_Store
+Thumbs.db

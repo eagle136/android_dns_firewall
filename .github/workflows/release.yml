@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (例如 v1.2)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25b
+
+      - name: Sync version from tag
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          ver="${TAG#v}"
+          case "$ver" in
+            ''|*[!0-9A-Za-z._-]*) echo "无效版本号: $TAG"; exit 1 ;;
+          esac
+          code=$(echo "$ver" | awk -F. '{printf "%d%02d%02d", $1, $2, $3}')
+          sed -i "s/^version=.*/version=$ver/" dnsfirewall/module.prop
+          sed -i "s/^versionCode=.*/versionCode=$code/" dnsfirewall/module.prop
+          echo "version=$ver versionCode=$code"
+
+      - name: Build dnsfw
+        run: make -C dnsfirewall/files/src NDK="${{ steps.ndk.outputs.ndk-path }}" install
+
+      - name: Package module
+        run: sh build.sh
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: DNS Firewall ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: output/*.zip
+          generate_release_notes: true
