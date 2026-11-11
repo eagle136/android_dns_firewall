@@ -138,6 +138,33 @@ header .sub { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
 .error { display: none; margin: 0; padding: 9px 12px; color: var(--danger); font-size: 13px; border-bottom: 1px solid var(--border); }
 .error.show { display: block; }
 
+/* 搜索结果: 输入框里的字母/数字片段去匹配当前分类已有条目，每条可直接删除 */
+.cand {
+  padding: 8px 12px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.cand[hidden] { display: none; }
+.cand-title { color: var(--muted); font-size: 11.5px; margin: 0 0 5px; }
+.cand-item {
+  display: flex; align-items: center; gap: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px; line-height: 1.5;
+  color: var(--text); overflow-wrap: anywhere;
+}
+.cand-item .name { flex: 1; min-width: 0; }
+.cand-item.dup { color: var(--danger); }
+.cand-item .badge {
+  flex: none;
+  padding: 0 5px; border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger); font-size: 11px; font-family: inherit;
+}
+.cand-more { margin-top: 4px; color: var(--muted); font-size: 11.5px; }
+
+/* 名单区只占半屏，超出在窗口内滚动 */
+#listBox { max-height: 50vh; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+
 ul.list { list-style: none; margin: 0; padding: 0; }
 ul.list li {
   display: flex; align-items: center; gap: 10px;
@@ -151,7 +178,7 @@ ul.list .name {
   font-size: 13.5px;
   overflow-wrap: anywhere;
 }
-ul.list .del {
+ul.list .del, .cand-item .del {
   flex: none;
   height: 30px; padding: 0 11px;
   border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
@@ -159,7 +186,8 @@ ul.list .del {
   background: transparent; color: var(--danger);
   font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
 }
-ul.list .del:active { transform: scale(.97); }
+ul.list .del:active, .cand-item .del:active { transform: scale(.97); }
+.cand-item .del { height: 26px; padding: 0 9px; font-size: 12px; }
 .empty { padding: 26px 12px; text-align: center; color: var(--muted); font-size: 13px; }
 .loading { padding: 26px 12px; text-align: center; color: var(--muted); font-size: 13px; }
 
@@ -197,6 +225,7 @@ ul.list .del:active { transform: scale(.97); }
   background: var(--panel-2);
 }
 .modal-head strong { flex: 1; font-size: 14.5px; }
+.modal-head { flex-wrap: wrap; }   /* 实时日志那几个按钮在窄屏要能换行 */
 .modal-body { flex: 1; min-height: 0; overflow: auto; }
 .modal-body pre {
   margin: 0; padding: 12px;
@@ -256,6 +285,7 @@ ul.list .del:active { transform: scale(.97); }
       <input id="entryInput" type="text" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="example.com">
       <button class="btn primary" id="addBtn" type="submit">添加</button>
     </form>
+    <div class="cand" id="candBox" hidden></div>
     <p class="hint" id="hint"></p>
     <p class="error" id="formError"></p>
     <div id="listBox"><div class="loading">读取中…</div></div>
@@ -267,7 +297,11 @@ ul.list .del:active { transform: scale(.97); }
   </p>
 
   <div class="foot-actions">
-    <button class="btn ghost" id="logBtn" type="button">查询解析记录</button>
+    <button class="btn ghost" id="logBtn" type="button">解析记录</button>
+    <button class="btn ghost" id="blogBtn" type="button">拦截记录</button>
+  </div>
+  <div class="foot-actions">
+    <button class="btn ghost" id="liveBtn" type="button">实时日志</button>
     <button class="btn ghost danger" id="logToggle" type="button" disabled>关闭记录</button>
   </div>
   <div class="foot-actions">
@@ -279,12 +313,37 @@ ul.list .del:active { transform: scale(.97); }
 <div class="modal" id="logModal">
   <div class="modal-card">
     <div class="modal-head">
-      <strong>查询解析记录</strong>
+      <strong>解析记录</strong>
       <button class="icon-btn" id="logRefresh" type="button">刷新</button>
       <button class="icon-btn" id="logClose" type="button">关闭</button>
     </div>
     <div class="modal-body"><pre id="logText">读取中…</pre></div>
     <p class="modal-note" id="logNote">—</p>
+  </div>
+</div>
+
+<div class="modal" id="blogModal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong>拦截记录</strong>
+      <button class="icon-btn" id="blogRefresh" type="button">刷新</button>
+      <button class="icon-btn" id="blogClose" type="button">关闭</button>
+    </div>
+    <div class="modal-body"><pre id="blogText">读取中…</pre></div>
+    <p class="modal-note" id="blogNote">—</p>
+  </div>
+</div>
+
+<div class="modal" id="liveModal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong>实时日志</strong>
+      <button class="icon-btn" id="liveToggle" type="button">暂停</button>
+      <button class="icon-btn" id="liveClear" type="button">清空</button>
+      <button class="icon-btn" id="liveClose" type="button">关闭</button>
+    </div>
+    <div class="modal-body"><pre id="liveText">读取中…</pre></div>
+    <p class="modal-note" id="liveNote">—</p>
   </div>
 </div>
 
@@ -306,14 +365,18 @@ ul.list .del:active { transform: scale(.97); }
 
   var CONF_DIR = '/data/adb/modules/dnsfirewall/files/conf';
   var QLOG_PATH = '/data/adb/modules/dnsfirewall/dnsfw_queries.log';
+  var BLOG_PATH = '/data/adb/modules/dnsfirewall/dnsfw_blocked.log';
+  var RLOG_PATH = '/data/adb/modules/dnsfirewall/dnsfw_recent.log';
   var QLOG_SWITCH = CONF_DIR + '/qlog.off';
+  var LOG_TAIL = 400;   /* 去重日志: 最近 400 条 */
+  var LIVE_TAIL = 50;   /* 实时日志: 最近 50 条 */
   var BACKUP_PATH = '/sdcard/Download/dnsfirewall-backup.tar';
   var RESTORE_DIR = '/data/local/tmp/dnsfw-restore';
   var KINDS = {
     blocklist: {
       file: 'blocklist.txt', label: '黑名单', type: 'domain', strict: true,
       placeholder: 'example.com 或 *.example.com',
-      hint: '命中后拦截（A 查询回 127.0.0.1，其它类型回 NXDOMAIN）；白名单可豁免。'
+      hint: '命中后一律回 NXDOMAIN（域名不存在）；白名单可豁免。'
     },
     whitelist: {
       file: 'whitelist.txt', label: '白名单', type: 'domain', strict: false,
@@ -335,7 +398,9 @@ ul.list .del:active { transform: scale(.97); }
       upstream: { lines: [], entries: [], loaded: false, error: '' }
     },
     saving: false,
-    logEnabled: null
+    logEnabled: null,
+    liveOn: true,
+    liveTimer: null
   };
 
   var el = {
@@ -343,6 +408,7 @@ ul.list .del:active { transform: scale(.97); }
     input: document.getElementById('entryInput'),
     addForm: document.getElementById('addForm'),
     addBtn: document.getElementById('addBtn'),
+    candBox: document.getElementById('candBox'),
     hint: document.getElementById('hint'),
     formError: document.getElementById('formError'),
     listBox: document.getElementById('listBox'),
@@ -360,6 +426,19 @@ ul.list .del:active { transform: scale(.97); }
     logNote: document.getElementById('logNote'),
     logRefresh: document.getElementById('logRefresh'),
     logClose: document.getElementById('logClose'),
+    blogBtn: document.getElementById('blogBtn'),
+    blogModal: document.getElementById('blogModal'),
+    blogText: document.getElementById('blogText'),
+    blogNote: document.getElementById('blogNote'),
+    blogRefresh: document.getElementById('blogRefresh'),
+    blogClose: document.getElementById('blogClose'),
+    liveBtn: document.getElementById('liveBtn'),
+    liveModal: document.getElementById('liveModal'),
+    liveText: document.getElementById('liveText'),
+    liveNote: document.getElementById('liveNote'),
+    liveToggle: document.getElementById('liveToggle'),
+    liveClear: document.getElementById('liveClear'),
+    liveClose: document.getElementById('liveClose'),
     exportBtn: document.getElementById('exportBtn'),
     importBtn: document.getElementById('importBtn'),
     confirmModal: document.getElementById('confirmModal'),
@@ -430,6 +509,23 @@ ul.list .del:active { transform: scale(.97); }
   function entryIndexes(lines) {
     var out = [];
     for (var i = 0; i < lines.length; i++) if (isEntry(lines[i])) out.push(i);
+    return out;
+  }
+
+  /* 读入和写出都过一遍: 去行首尾空白、丢纯空白行、条目大小写不敏感去重（注释原样保留）。
+     空白行原来只在「添加」路径弹掉尾部一个，删除路径不弹，而 joinLines 每次又补一个换行，
+     所以每删一条文件就多一个空行；重复条目同样会让删除看着没生效。 */
+  function normalizeLines(lines) {
+    var out = [], seen = {};
+    for (var i = 0; i < lines.length; i++) {
+      var t = String(lines[i]).trim();
+      if (!t) continue;
+      if (t.charAt(0) === '#') { out.push(t); continue; }
+      var key = t.toLowerCase();
+      if (seen[key]) continue;
+      seen[key] = 1;
+      out.push(t);
+    }
     return out;
   }
 
@@ -594,6 +690,7 @@ ul.list .del:active { transform: scale(.97); }
     el.addBtn.disabled = !!st.error || state.saving;
     if (st.error) showError('读取失败：' + st.error + '（本页只读）');
     updateTabs();
+    renderCandidates();
 
     document.querySelectorAll('.tab').forEach(function (b) {
       b.classList.toggle('active', b.getAttribute('data-kind') === kind);
@@ -640,10 +737,90 @@ ul.list .del:active { transform: scale(.97); }
     el.listBox.appendChild(ul);
   }
 
+  /* ---------- 搜索结果（可直接删除） ----------
+   * 把输入框里的字母/数字片段拿去匹配当前分类已有条目:
+   * 任一片段命中即算结果，完全相同的标「已存在」，每条后面带删除按钮。 */
+  var CAND_MAX = 12;
+
+  function inputTokens(v) {
+    var m = String(v).toLowerCase().match(/[a-z0-9]+/g);
+    return m || [];
+  }
+
+  function renderCandidates() {
+    var box = el.candBox;
+    box.textContent = '';
+    box.hidden = true;
+
+    var kind = state.current;
+    var cfg = KINDS[kind];
+    var st = state.files[kind];
+    if (!cfg || !st.loaded || st.error) return;
+
+    var raw = el.input.value.trim();
+    if (!raw) return;
+    var toks = inputTokens(raw);
+    if (!toks.length) return;
+
+    var needle = raw.toLowerCase();
+    var seen = {};
+    var hits = [];
+    for (var i = 0; i < st.entries.length; i++) {
+      var lineIdx = st.entries[i];
+      var text = st.lines[lineIdx].trim();
+      var low = text.toLowerCase();
+      var ok = false;
+      for (var j = 0; j < toks.length; j++) {
+        if (low.indexOf(toks[j]) >= 0) { ok = true; break; }
+      }
+      if (!ok || seen[low]) continue;
+      seen[low] = 1;
+      hits.push({ text: text, idx: lineIdx, exact: low === needle });
+    }
+    if (!hits.length) return;
+
+    hits.sort(function (a, b) { return (b.exact ? 1 : 0) - (a.exact ? 1 : 0); });
+
+    var title = document.createElement('p');
+    title.className = 'cand-title';
+    title.textContent = cfg.label + '里匹配到 ' + hits.length + ' 条';
+    box.appendChild(title);
+
+    hits.slice(0, CAND_MAX).forEach(function (h) {
+      var row = document.createElement('div');
+      row.className = 'cand-item' + (h.exact ? ' dup' : '');
+      var name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = h.text;
+      row.appendChild(name);
+      if (h.exact) {
+        var b = document.createElement('span');
+        b.className = 'badge';
+        b.textContent = '已存在';
+        row.appendChild(b);
+      }
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'del';
+      del.textContent = '删除';
+      del.addEventListener('click', function () { removeEntry(kind, h.idx, del); });
+      row.appendChild(del);
+      box.appendChild(row);
+    });
+
+    if (hits.length > CAND_MAX) {
+      var more = document.createElement('p');
+      more.className = 'cand-more';
+      more.textContent = '还有 ' + (hits.length - CAND_MAX) + ' 条未显示';
+      box.appendChild(more);
+    }
+    box.hidden = false;
+  }
+
   /* ---------- 数据操作 ---------- */
   async function load(kind) {
     var text = await readConf(kind);
-    var lines = splitLines(text);
+    var lines = normalizeLines(splitLines(text));
     state.files[kind].lines = lines;
     state.files[kind].entries = entryIndexes(lines);
     state.files[kind].loaded = true;
@@ -677,7 +854,7 @@ ul.list .del:active { transform: scale(.97); }
     loadLogState();
   }
 
-  /* ---------- 解析记录 ---------- */
+  /* ---------- 记录（解析 / 拦截 / 实时） ---------- */
   function renderLogToggle() {
     if (state.logEnabled === null) return;
     el.logToggle.disabled = false;
@@ -697,50 +874,147 @@ ul.list .del:active { transform: scale(.97); }
     }
   }
 
-  async function loadLog() {
-    el.logText.textContent = '读取中…';
-    el.logNote.textContent = '—';
-    if (!hasKsu()) { el.logText.textContent = '未检测到 KernelSU WebUI 环境'; return; }
+  /* 只取尾部: 行数用 wc -l 单独取，正文用 tail -n。返回 {missing,total,lines} */
+  async function fetchLogTail(path, tail) {
+    var out = await exec("if [ -f '" + path + "' ]; then printf 'OK '; wc -l < '" + path +
+      "' | tr -d '\\n'; printf '\\n'; tail -n " + tail + " '" + path +
+      "'; else printf '%s' '@@MISSING@@'; fi");
+    if (out === '@@MISSING@@') return { missing: true, total: null, lines: [] };
+    var nl = out.indexOf('\n');
+    var head = nl < 0 ? out : out.slice(0, nl);
+    if (head.indexOf('OK ') !== 0) throw new Error('输出无法解析');
+    var total = parseInt(head.slice(3), 10);
+    var body = nl < 0 ? '' : out.slice(nl + 1);
+    var lines = body.split('\n').filter(function (l) {
+      return l.trim() !== '' && l.charAt(0) !== '#';
+    });
+    return { missing: false, total: isFinite(total) ? total : null, lines: lines };
+  }
+
+  /* 三份日志共用一套渲染: 路径、条数、脚注由调用方给。
+     quiet=true 用于实时刷新时不闪「读取中…」，避免每 1.5 s 抖一下 */
+  async function showLog(opts) {
+    if (!opts.quiet) {
+      opts.textEl.textContent = '读取中…';
+      opts.noteEl.textContent = '—';
+    }
+    if (!hasKsu()) { opts.textEl.textContent = '未检测到 KernelSU WebUI 环境'; return null; }
     try {
-      var out = await exec("if [ -f '" + QLOG_PATH + "' ]; then printf 'OK '; wc -l < '" +
-        QLOG_PATH + "' | tr -d '\\n'; printf '\\n'; tail -n 400 '" + QLOG_PATH +
-        "'; else printf '%s' '@@MISSING@@'; fi");
-      if (out === '@@MISSING@@') {
-        el.logText.textContent = '暂无解析记录（文件不存在）';
-        el.logNote.textContent = QLOG_PATH;
-        return;
+      var r = await fetchLogTail(opts.path, opts.tail);
+      if (r.missing) {
+        opts.textEl.textContent = opts.missing;
+        opts.noteEl.textContent = opts.path;
+        return r;
       }
-      var nl = out.indexOf('\n');
-      var head = nl < 0 ? out : out.slice(0, nl);
-      if (head.indexOf('OK ') !== 0) throw new Error('输出无法解析');
-      var total = parseInt(head.slice(3), 10);
-      var body = nl < 0 ? '' : out.slice(nl + 1);
-      var lines = body.split('\n').filter(function (l) {
-        return l.trim() !== '' && l.charAt(0) !== '#';
-      });
-      el.logText.textContent = lines.length ? lines.join('\n') : '（暂无记录）';
-      el.logNote.textContent = QLOG_PATH + ' · 共 ' + (isFinite(total) ? total : '?') +
-        ' 行，显示最近 ' + Math.min(400, lines.length) + ' 条（重复域名只留一份）' +
+      opts.textEl.textContent = r.lines.length ? r.lines.join('\n') : '（暂无记录）';
+      opts.noteEl.textContent = opts.path + ' · 共 ' + (r.total === null ? '?' : r.total) +
+        ' 行，显示最近 ' + Math.min(opts.tail, r.lines.length) + ' 条' + opts.suffix +
         (state.logEnabled === false ? ' · 记录已关闭' : '');
+      return r;
     } catch (e) {
-      el.logText.textContent = '读取失败：' + (e && e.message || e);
-      el.logNote.textContent = QLOG_PATH;
+      opts.textEl.textContent = '读取失败：' + (e && e.message || e);
+      opts.noteEl.textContent = opts.path;
+      return null;
     }
   }
 
-  function closeLog() { el.logModal.classList.remove('show'); }
+  function loadQueryLog() {
+    return showLog({ path: QLOG_PATH, tail: LOG_TAIL, textEl: el.logText, noteEl: el.logNote,
+      missing: '暂无解析记录（文件不存在）', suffix: '（重复域名只留一份）' });
+  }
+  function loadBlockLog() {
+    return showLog({ path: BLOG_PATH, tail: LOG_TAIL, textEl: el.blogText, noteEl: el.blogNote,
+      missing: '暂无拦截记录（文件不存在）', suffix: '（重复域名只留一份）' });
+  }
+  /* 实时日志: 新行在底部，自动刷新时只在「本来就在底部」才跟着滚到底，
+     用户往上翻看历史时不会被拽回去 */
+  async function loadLiveLog(quiet) {
+    var body = el.liveModal.querySelector('.modal-body');
+    var stick = !body || (body.scrollHeight - body.scrollTop - body.clientHeight < 40);
+    var r = await showLog({ path: RLOG_PATH, tail: LIVE_TAIL, textEl: el.liveText, noteEl: el.liveNote,
+      missing: '暂无实时日志（文件不存在）', suffix: '（不去重，逐条）', quiet: !!quiet });
+    if (body && stick) body.scrollTop = body.scrollHeight;
+    return r;
+  }
+
+  /* 实时滚动: 弹窗开着才拉，关掉就停，不空转 */
+  function stopLive() {
+    if (state.liveTimer) { clearInterval(state.liveTimer); state.liveTimer = null; }
+  }
+  function startLive() {
+    stopLive();
+    if (!state.liveOn) return;
+    state.liveTimer = setInterval(function () {
+      if (!el.liveModal.classList.contains('show')) { stopLive(); return; }
+      loadLiveLog(true);
+    }, 1500);
+  }
+  function renderLiveToggle() {
+    el.liveToggle.textContent = state.liveOn ? '暂停' : '实时';
+  }
+  function closeLiveModal() {
+    stopLive();
+    el.liveModal.classList.remove('show');
+  }
+
+  async function clearLiveLog() {
+    if (!hasKsu()) { toast('未检测到 KernelSU WebUI 环境', true); return; }
+    el.liveClear.disabled = true;
+    try {
+      /* 直接截断: dnsfw 用 O_APPEND 打开，下一次写自然落到新的文件尾 */
+      await exec(": > '" + RLOG_PATH + "'");
+      toast('实时日志已清空');
+      loadLiveLog();
+    } catch (e) {
+      toast('清空失败：' + (e && e.message || e), true);
+    } finally {
+      el.liveClear.disabled = false;
+    }
+  }
 
   el.logBtn.addEventListener('click', function () {
     el.logModal.classList.add('show');
-    loadLog();
+    loadQueryLog();
   });
-  el.logRefresh.addEventListener('click', loadLog);
-  el.logClose.addEventListener('click', closeLog);
+  el.logRefresh.addEventListener('click', loadQueryLog);
+  el.logClose.addEventListener('click', function () { el.logModal.classList.remove('show'); });
   el.logModal.addEventListener('click', function (ev) {
-    if (ev.target === el.logModal) closeLog();
+    if (ev.target === el.logModal) el.logModal.classList.remove('show');
   });
+
+  el.blogBtn.addEventListener('click', function () {
+    el.blogModal.classList.add('show');
+    loadBlockLog();
+  });
+  el.blogRefresh.addEventListener('click', loadBlockLog);
+  el.blogClose.addEventListener('click', function () { el.blogModal.classList.remove('show'); });
+  el.blogModal.addEventListener('click', function (ev) {
+    if (ev.target === el.blogModal) el.blogModal.classList.remove('show');
+  });
+
+  el.liveBtn.addEventListener('click', function () {
+    el.liveModal.classList.add('show');
+    renderLiveToggle();
+    loadLiveLog();
+    startLive();
+  });
+  el.liveClose.addEventListener('click', closeLiveModal);
+  el.liveModal.addEventListener('click', function (ev) {
+    if (ev.target === el.liveModal) closeLiveModal();
+  });
+  el.liveToggle.addEventListener('click', function () {
+    state.liveOn = !state.liveOn;
+    renderLiveToggle();
+    if (state.liveOn) { loadLiveLog(); startLive(); } else stopLive();
+  });
+  el.liveClear.addEventListener('click', clearLiveLog);
+
   document.addEventListener('keydown', function (ev) {
-    if (ev.key === 'Escape') { closeLog(); closeConfirm(); }
+    if (ev.key !== 'Escape') return;
+    el.logModal.classList.remove('show');
+    el.blogModal.classList.remove('show');
+    closeLiveModal();
+    closeConfirm();
   });
 
   el.logToggle.addEventListener('click', async function () {
@@ -751,8 +1025,10 @@ ul.list .del:active { transform: scale(.97); }
       await exec(on ? "printf 'off\\n' > '" + QLOG_SWITCH + "'" : "rm -f '" + QLOG_SWITCH + "'");
       state.logEnabled = !on;
       renderLogToggle();
-      toast(on ? '已关闭解析记录' : '已开启解析记录');
-      if (el.logModal.classList.contains('show')) loadLog();
+      toast(on ? '已关闭记录（三份都停）' : '已开启记录');
+      if (el.logModal.classList.contains('show')) loadQueryLog();
+      if (el.blogModal.classList.contains('show')) loadBlockLog();
+      if (el.liveModal.classList.contains('show')) loadLiveLog();
     } catch (e) {
       toast('操作失败：' + (e && e.message || e), true);
       renderLogToggle();
@@ -834,20 +1110,33 @@ ul.list .del:active { transform: scale(.97); }
     try { await fn(); } finally { closeConfirm(); }
   });
 
-  async function save(kind, lines) {
+  async function save(kind, rawLines) {
     if (state.saving || state.files[kind].error) return;
+    var lines = normalizeLines(rawLines);
     state.saving = true;
     el.addBtn.disabled = true;
     el.addBtn.textContent = '保存中…';
     showError('');
     try {
       await writeConf(kind, lines);
-      state.files[kind].lines = lines;
-      state.files[kind].entries = entryIndexes(lines);
+      /* 回读校验: 有的 su 把退出码抹成 0，写没落盘只认文件里的实际内容，
+         页面也以文件内容为准，避免出现「看着删掉了、其实还在」 */
+      var disk = null;
+      try { disk = normalizeLines(splitLines(await readConf(kind))); } catch (e) { disk = null; }
+      var shown = disk || lines;
+      state.files[kind].lines = shown;
+      state.files[kind].entries = entryIndexes(shown);
       state.files[kind].loaded = true;
       state.files[kind].error = '';
       render();
-      toast('已保存，正在热加载');
+      if (disk && disk.join('\n') !== lines.join('\n')) {
+        showError('写入未生效：文件内容与页面不一致，已按文件内容刷新');
+        toast('写入未生效', true);
+      } else if (disk) {
+        toast('已保存并核对');
+      } else {
+        toast('已保存（未核对）');
+      }
     } catch (e) {
       showError('写入失败：' + (e && e.message || e));
       toast('写入失败', true);
@@ -858,6 +1147,8 @@ ul.list .del:active { transform: scale(.97); }
     }
   }
 
+  el.input.addEventListener('input', renderCandidates);
+
   el.addForm.addEventListener('submit', function (ev) {
     ev.preventDefault();
     var kind = state.current;
@@ -866,15 +1157,22 @@ ul.list .del:active { transform: scale(.97); }
     var err = validate(kind, value);
     if (err) { showError(err); el.input.focus(); return; }
     var st = state.files[kind];
+    var low = value.toLowerCase();
+    for (var i = 0; i < st.entries.length; i++) {
+      if (st.lines[st.entries[i]].trim().toLowerCase() === low) {
+        showError(KINDS[kind].label + '里已经有这一条');
+        return;
+      }
+    }
     var lines = st.lines.slice();
-    if (lines.length && lines[lines.length - 1] === '') lines.pop();
     lines.push(value);
     el.input.value = '';
     save(kind, lines);
   });
 
   function removeEntry(kind, lineIdx, btn) {
-    if (state.saving || state.files[kind].error) return;
+    if (state.saving) { toast('正在保存，请稍候', true); return; }
+    if (state.files[kind].error) { toast('本页读取失败，暂不写入', true); return; }
     var st = state.files[kind];
     var lines = st.lines.slice();
     lines.splice(lineIdx, 1);

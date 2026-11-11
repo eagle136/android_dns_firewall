@@ -69,13 +69,17 @@ if [ -n "$(find "$SRC/files/src/dnsfw.c" -newer "$BIN" 2>/dev/null)" ]; then
   echo "      （设备上 Termux: make install 同理）"
   exit 1
 fi
-want_qlog="$(sed -n 's/^[[:space:]]*#[[:space:]]*define[[:space:]]*QLOG_PATH[[:space:]]*"\([^"]*\)".*/\1/p' \
-               "$SRC/files/src/dnsfw.c" | head -1)"
-if [ -n "$want_qlog" ] && ! grep -a -q -F -- "$want_qlog" "$BIN" 2>/dev/null; then
-  echo "错误: $BIN 里没有源码当前的默认解析记录路径「$want_qlog」—— 是上一版源码编的"
-  echo "      重编并拷入: cd $SRC/files/src && make && make install"
-  exit 1
-fi
+# 三个默认记录路径都核一遍（解析 / 拦截 / 实时），任何一路换了名字都得重编
+for _def in QLOG_PATH BLOG_PATH RLOG_PATH; do
+  want="$(sed -n "s/^[[:space:]]*#[[:space:]]*define[[:space:]]*${_def}[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+             "$SRC/files/src/dnsfw.c" | head -1)"
+  [ -n "$want" ] || continue
+  if ! grep -a -q -F -- "$want" "$BIN" 2>/dev/null; then
+    echo "错误: $BIN 里没有源码当前的 $_def「$want」—— 是上一版源码编的"
+    echo "      重编并拷入: cd $SRC/files/src && make && make install"
+    exit 1
+  fi
+done
 # 配置目录同理: 路径换了还装旧二进制，dnsfw 会去监听已经不用的目录
 want_conf="$(sed -n 's/^CONFDIR[[:space:]]*?=[[:space:]]*//p' "$SRC/files/src/Makefile" | head -1)"
 if [ -n "$want_conf" ] && ! grep -a -q -F -- "$want_conf" "$BIN" 2>/dev/null; then

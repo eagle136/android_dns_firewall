@@ -1,6 +1,6 @@
 id=dnsfirewall
 name=DNS Firewall
-version=1.0
-versionCode=10000
+version=1.2
+versionCode=10200
 author=eagle
 description=本地安卓DNS网络防火墙，拦截有害网站，支持webui配置，数据导入导出，有问题提交Issues或自行提交更改，讨论797433615

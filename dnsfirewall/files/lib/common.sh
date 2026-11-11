@@ -23,8 +23,11 @@ CONFDIR="$DEFCONF"
 RUNDIR="$PERSIST/run"
 LOGDIR="$PERSIST/logs"
 LOGFILE="$LOGDIR/dnsfw.log"
-# 解析记录放模块根目录（按约定，方便和模块文件一起直接翻）；升级/重装会把它清掉
+# 记录文件放模块根目录（按约定，方便和模块文件一起直接翻）；升级/重装会把它清掉
+# 两份去重日志（解析/拦截）+ 一份实时流水（不去重），见 dnsfw.c 的「解析/拦截记录」
 QLOGFILE="$MODDIR/dnsfw_queries.log"
+BLOGFILE="$MODDIR/dnsfw_blocked.log"
+RLOGFILE="$MODDIR/dnsfw_recent.log"
 PIDFILE="$RUNDIR/dnsfw.pid"
 WDOGFILE="$RUNDIR/watchdog.pid"
 STATEFILE="$PERSIST/state"     # 1=开机启动(默认) 0=不启动
@@ -124,9 +127,37 @@ conf_entries() {         # conf_entries <file> —— 去注释、去空白的�
 # 只重定向 UDP 53: dnsfw 没有 TCP 监听器，把 TCP 53 也重定向会直接断掉
 # 依赖 TCP DNS 的解析（大应答、某些 DNS64 场景）。TCP 不过滤属已知限制。
 
+# ---- filter 表的上游豁免（用户明确要求） ----------------------------------
+# ColorOS 在 filter OUTPUT 末尾有一条:
+#   -o wlan0 -p udp -m udp --dport 53 -m string --hex-string "|001c0001|" -j REJECT
+# |001c0001| 就是 AAAA 查询类型。它不只拦应用自己发的包，dnsfw 转发出去的 AAAA
+# 也一起被打掉，sendto 直接返回 EPERM。表现：进程在、查询也收到了，每条都
+# "发往上游失败: Operation not permitted" -> 全 SERVFAIL、网页打不开、
+# 所有 IPv6 解析同时挂掉（就是「ipv6 一直异常」）。
+# 只按 dnsfw 上游 socket 的源端口段放行（SPORT_LO..SPORT_HI），插在 OUTPUT 链首，
+# 其它 DNS 流量照旧受系统规则约束。
+upstream_exempt_add() {  # upstream_exempt_add <4|6>
+  _b=$(ipt_bin "$1") || return 1
+  "$_b" -t filter -C OUTPUT -p udp -m udp --sport "$SPORT_LO:$SPORT_HI" -j ACCEPT >/dev/null 2>&1 && return 0
+  "$_b" -t filter -I OUTPUT 1 -p udp -m udp --sport "$SPORT_LO:$SPORT_HI" -j ACCEPT >/dev/null 2>&1
+}
+
+upstream_exempt_del() {  # 幂等，没装过也不报错
+  _b=$(ipt_bin "$1") || return 0
+  _i=0
+  while [ "$_i" -lt 10 ] &&
+        "$_b" -t filter -C OUTPUT -p udp -m udp --sport "$SPORT_LO:$SPORT_HI" -j ACCEPT >/dev/null 2>&1; do
+    "$_b" -t filter -D OUTPUT -p udp -m udp --sport "$SPORT_LO:$SPORT_HI" -j ACCEPT >/dev/null 2>&1 || break
+    _i=$((_i + 1))
+  done
+  return 0
+}
+
 apply_rules() {          # apply_rules <4|6> ；返回 0=规则已生效
   _t="$1"
   _b=$(ipt_bin "$_t") || return 3
+  # 必须排在系统那条 AAAA REJECT 之前（-I OUTPUT 1），否则上游包先被打掉
+  upstream_exempt_add "$_t"
   "$_b" -t nat -N "$IPT_CHAIN" >/dev/null 2>&1
   "$_b" -t nat -F "$IPT_CHAIN" >/dev/null 2>&1
   "$_b" -t nat -A "$IPT_CHAIN" -p udp -m udp --sport "$SPORT_LO:$SPORT_HI" -j RETURN >/dev/null 2>&1 || return 1
@@ -144,12 +175,15 @@ rules_present() {        # rules_present <4|6>
   "$_b" -t nat -S OUTPUT 2>/dev/null | grep -q -- "-j $IPT_CHAIN" || return 1
   "$_b" -t nat -S "$IPT_CHAIN" 2>/dev/null | grep -q -- "--to-ports $DNS_PORT" || return 1
   "$_b" -t nat -S "$IPT_CHAIN" 2>/dev/null | grep -q -- "--sport $SPORT_LO:$SPORT_HI" || return 1
+  # 上游豁免也要在，否则 dnsfw 转发出去的 AAAA 会被系统那条 REJECT 打死
+  "$_b" -t filter -C OUTPUT -p udp -m udp --sport "$SPORT_LO:$SPORT_HI" -j ACCEPT >/dev/null 2>&1 || return 1
   return 0
 }
 
 del_rules() {            # del_rules <4|6> —— 幂等，没装过也不报错
   _t="$1"
   _b=$(ipt_bin "$_t") || return 0
+  upstream_exempt_del "$_t"      # 撤规则时把自己的出站豁免一起撤掉，不留后门
   _i=0
   while [ "$_i" -lt 20 ] &&
         "$_b" -t nat -C OUTPUT -p udp -m udp --dport 53 -j "$IPT_CHAIN" >/dev/null 2>&1; do
@@ -339,6 +373,8 @@ start_daemon() {
   ensure_dirs
   export DNSFW_CONF="$CONFDIR"
   export DNSFW_QLOG="${DNSFW_QLOG:-$QLOGFILE}"
+  export DNSFW_BLOG="${DNSFW_BLOG:-$BLOGFILE}"
+  export DNSFW_RLOG="${DNSFW_RLOG:-$RLOGFILE}"
   is_running || sweep_orphans
   nohup "$DNSFW_BIN" serve </dev/null >>"$LOGFILE" 2>&1 &
   echo $! >"$PIDFILE"

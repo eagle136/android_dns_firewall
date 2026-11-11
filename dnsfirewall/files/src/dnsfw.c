@@ -3,7 +3,7 @@
  *
  * 架构: select 事件循环处理 DNS；另起一个线程用 inotify 监听配置目录，
  *       名单/上游文件一改就重载（格式错误的行跳过，不影响其它条目）
- *   - 拦截: A 查询回一条本地 Sink v4 地址的应答，其它类型回 NXDOMAIN，完全不碰上游
+ *   - 拦截: 一律回 NXDOMAIN（含 A），不给 sinkhole 地址，完全不碰上游
  *   - 透传: 每查询一个在途槽位，最多 MAX_INFLIGHT 路并发等上游，
  *           单上游 UPSTREAM_TIMEOUT_MS 超时后换下一个未试过的上游；
  *           连续失败的上游进入冷却，不再拖慢后续查询；全失败回 SERVFAIL；
@@ -26,9 +26,16 @@
  *   dnsfw test <域名> [域名...]     测试流水线判定并打印命中的条目
  *   dnsfw lists                     显示已加载列表统计
  *
+ * 记录: 两份去重域名日志 + 一份实时流水
+ *   dnsfw_queries.log  放行（含未命中黑名单）的域名，去重；名单一变就按新名单重扫
+ *   dnsfw_blocked.log  命中黑名单且未被白名单豁免的域名，去重；与上面互相搬移
+ *   dnsfw_recent.log   每条查询一行（不去重），给网页滚动看最近若干条
+ *
  * 环境变量:
  *   DNSFW_CONF  覆盖配置目录
  *   DNSFW_QLOG  覆盖解析记录文件（默认模块根目录的 dnsfw_queries.log；设为 off 关闭记录）
+ *   DNSFW_BLOG  覆盖拦截记录文件（默认模块根目录的 dnsfw_blocked.log；设为 off 关闭它）
+ *   DNSFW_RLOG  覆盖实时日志文件（默认模块根目录的 dnsfw_recent.log；设为 off 关闭它）
  * ========================================================================= */
 
 #include <stdint.h>
@@ -54,12 +61,21 @@
 #define CONFDIR "/data/adb/modules/dnsfirewall/files/conf"
 #endif
 
-/* 解析记录文件: 默认放模块根目录（装/刷机时随模块一起被替换），可用 DNSFW_QLOG 覆盖。
-   模块根目录由脚本层用 $MODDIR 导出，这里的默认值只给手工跑 serve 时兜底。 */
+/* 解析/拦截记录文件: 默认放模块根目录（装/刷机时随模块一起被替换），
+   可用 DNSFW_QLOG / DNSFW_BLOG 覆盖。模块根目录由脚本层用 $MODDIR 导出，
+   这里的默认值只给手工跑 serve 时兜底。 */
 #ifndef QLOG_PATH
 #define QLOG_PATH             "/data/adb/modules/dnsfirewall/dnsfw_queries.log"
 #endif
+#ifndef BLOG_PATH
+#define BLOG_PATH             "/data/adb/modules/dnsfirewall/dnsfw_blocked.log"
+#endif
+#ifndef RLOG_PATH
+#define RLOG_PATH             "/data/adb/modules/dnsfirewall/dnsfw_recent.log"
+#endif
 #define QLOG_FALLBACK         "/data/local/tmp/dnsfw_queries.log"
+#define BLOG_FALLBACK         "/data/local/tmp/dnsfw_blocked.log"
+#define RLOG_FALLBACK         "/data/local/tmp/dnsfw_recent.log"
 #define QLOG_MAX_BYTES        (2 * 1024 * 1024)   /* 宁丢历史也不能吃磁盘 */
 
 #define DNS_PORT              1053
@@ -76,16 +92,8 @@
 #define MAX_RECV              65536  /* UDP 数据报上限 */
 #define DRAIN_BUDGET          256    /* 每轮事件循环最多处理的新查询数 */
 
-#define RCODE_NOERROR 0
 #define RCODE_SERVFAIL 2
 #define RCODE_NXDOMAIN 3
-
-#define QTYPE_A                 1      /* 只有 A 查询用本地 Sink 地址打发 */
-#define BLOCK_A_TTL             1      /* 1 s: 不让 netd/浏览器把 Sink 地址缓存下来 */
-#define BLOCK_ANSWER_BYTES      16     /* 0xC00C 名字指针 + A 记录共 16 字节 */
-
-/* 黑名单命中的 A 查询回这个地址: 连接立刻被拒，等价于打不通 */
-static const uint8_t BLOCK_A[4] = { 127, 0, 0, 1 };
 
 static const char *verdict_str(int blocked)
 {
@@ -215,23 +223,38 @@ static void strset_free(strset_t *S)
     S->cap = S->used = 0;
 }
 
-/* ---------------- 解析记录（默认写在模块根目录） ----------------
- * 一行一个被解析过的域名，同一域名只留一份（大小写不敏感）。
- * 拦截与透传的查询都会出现; 畸形包没有域名可记, 只在运行日志里留痕。
- * 启动时把已有记录装进集合并压掉历史重复行，之后重复查询不再追加。
+/* ---------------- 解析/拦截记录（默认写在模块根目录） ----------------
+ * 两份日志、互不重复:
+ *   解析日志  放行（含未命中黑名单）的域名
+ *   拦截日志  命中黑名单且未被白名单豁免的域名
+ * 同一文件内重复域名只留一份（大小写不敏感）。名单一变就由 qlog_reconcile()
+ * 按新名单重扫两份文件，命中关系变了的域名在两者之间搬移，两份日志始终与
+ * 当前名单一致（见下面的「日志重匹配」一节）。
  * 只追加写; 打不开文件就降级到 /data/local/tmp，再不行就只告警一次、完全不记录。
  * 记录功能绝不许影响解析本身，所以这里任何失败都不改变主流程。 */
 
 #define QLOG_MAX_DOMAINS 100000   /* 去重集合上限: 再大就只追加查重，免得吃内存 */
 
-static FILE *g_qlog;
-static char  g_qlog_path[256];
-static long  g_qlog_bytes;
-static strset_t g_qlog_seen;
+typedef struct {
+    FILE       *fp;          /* NULL = 这一份没开起来（env 设了 off，或打不开） */
+    char        path[256];
+    long        bytes;
+    strset_t    seen;        /* 已写过的域名，重复查询不再追加 */
+    const char *hdr;         /* 文件为空时写的表头 */
+} qlog_t;
+
+static qlog_t g_qlog;        /* 解析（放行） */
+static qlog_t g_blog;        /* 拦截 */
+static qlog_t g_rlog;        /* 实时（不去重，逐条） */
+/* WebUI 的开关: conf 目录里存在 qlog.off 就三份一起停写（文件保留，删除即恢复） */
 static volatile int g_qlog_enabled = 1;
 
 static const char QLOG_HEADER[] =
-    "# dnsfw 解析域名记录: 一行一个被解析过的域名（拦截与透传都记，重复域名只留一份）\n";
+    "# dnsfw 解析域名记录: 一行一个被放行的域名（拦截的另记 dnsfw_blocked.log，重复只留一份）\n";
+static const char BLOG_HEADER[] =
+    "# dnsfw 拦截记录: 一行一个被拦截的域名（重复只留一份；解除拦截后移回 dnsfw_queries.log）\n";
+static const char RLOG_HEADER[] =
+    "# dnsfw 实时日志: 每条查询一行（HH:MM:SS 判定 域名），不去重，网页上滚动看最近若干条\n";
 
 /* WebUI 的开关: conf 目录里存在 qlog.off 就停止记录（文件保留，删除即恢复）。
  * 配置监听线程在目录变化时调用这里，主线程 qlog_write 只读标志。 */
@@ -243,112 +266,126 @@ static void qlog_sync_enabled(void)
     g_qlog_enabled = (n > 0 && (size_t)n < sizeof p && access(p, F_OK) == 0) ? 0 : 1;
 }
 
-/* 启动时压掉历史重复行: 边读边写 tmp，只保留首次出现，同时把域名装进集合。
- * 失败就放弃压缩、保留原文件；已经收进集合的条目仍然用于后续去重。 */
-static void qlog_compact(void)
+/* 超限就整份截断重建: 记录文件只做追加写，宁丢历史也不能把盘吃到没边 */
+static void qlog_reset_one(qlog_t *Q)
 {
-    FILE *in = fopen(g_qlog_path, "r");
-    if (!in) return;
-    char tmp[300];
-    snprintf(tmp, sizeof tmp, "%s.tmp", g_qlog_path);
-    FILE *out = fopen(tmp, "w");
-    if (!out) { fclose(in); return; }
-
-    fputs(QLOG_HEADER, out);
-    char line[512];
-    while (fgets(line, sizeof line, in)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        size_t n = strlen(p);
-        while (n && (p[n-1] == '\n' || p[n-1] == '\r')) p[--n] = 0;
-        if (!*p || *p == '#') continue;
-        if (g_qlog_seen.used >= QLOG_MAX_DOMAINS) { fprintf(out, "%s\n", p); continue; }
-        if (strset_insert(&g_qlog_seen, p) != 0) fprintf(out, "%s\n", p);
+    if (!Q->fp) return;
+    fclose(Q->fp);
+    Q->fp = NULL;
+    strset_free(&Q->seen);        /* 文件已重建，去重集合跟着清空 */
+    strset_init(&Q->seen);
+    Q->fp = fopen(Q->path, "w");
+    Q->bytes = 0;
+    if (!Q->fp) {
+        plog("警告: %s 重建失败，本次运行不再记录\n", Q->path);
+        return;
     }
-    int bad = ferror(in) || ferror(out);
-    fclose(in);
-    if (fclose(out) != 0) bad = 1;
-    if (bad || rename(tmp, g_qlog_path) != 0) {
-        unlink(tmp);
-        if (bad) plog("警告: 解析记录压缩失败，保留原文件\n");
+    fprintf(Q->fp, "# %s 超过 %d 字节已截断重建\n", Q->path, QLOG_MAX_BYTES);
+    fflush(Q->fp);
+    long p = ftell(Q->fp);
+    if (p > 0) Q->bytes = p;
+}
+
+/* 以追加方式挂上句柄；文件是空的就补表头 */
+static void qlog_open_append(qlog_t *Q)
+{
+    Q->fp = fopen(Q->path, "a");
+    if (!Q->fp) {
+        plog("警告: %s 打不开，本次运行不记录\n", Q->path);
+        return;
+    }
+    fseek(Q->fp, 0, SEEK_END);
+    long sz = ftell(Q->fp);
+    Q->bytes = sz > 0 ? sz : 0;
+    if (Q->bytes == 0) {
+        fputs(Q->hdr, Q->fp);
+        fflush(Q->fp);
+        long p = ftell(Q->fp);
+        if (p > 0) Q->bytes = p;
     }
 }
 
-/* 超限就整份截断重建: 记录文件只做追加写，宁丢历史也不能把盘吃到没边 */
-static void qlog_reset(void)
+/* 开一份记录。env 设成 off/0 就整份不记；打不开先建目录再试，仍不行退到 fallback。
+ * 任何失败都只影响记录，不影响解析。 */
+static void qlog_open_one(qlog_t *Q, const char *envname, const char *defpath,
+                          const char *fallback, const char *hdr, const char *label)
 {
-    if (!g_qlog) return;
-    fclose(g_qlog);
-    g_qlog = NULL;
-    strset_free(&g_qlog_seen);   /* 文件已重建，去重集合跟着清空 */
-    g_qlog = fopen(g_qlog_path, "w");
-    g_qlog_bytes = 0;
-    if (!g_qlog) {
-        plog("警告: 解析记录 %s 重建失败，本次运行不再记录\n", g_qlog_path);
+    memset(Q, 0, sizeof *Q);
+    strset_init(&Q->seen);
+    Q->hdr = hdr;
+
+    const char *env = getenv(envname);
+    if (env && (!*env || strcasecmp(env, "off") == 0 || strcmp(env, "0") == 0)) {
+        plog("%s: 已关闭（%s 设成 off）\n", label, envname);
         return;
     }
-    fprintf(g_qlog, "# %s 超过 %d 字节已截断重建\n", g_qlog_path, QLOG_MAX_BYTES);
-    fflush(g_qlog);
-    long p = ftell(g_qlog);
-    if (p > 0) g_qlog_bytes = p;
+    const char *want = (env && *env) ? env : defpath;
+    snprintf(Q->path, sizeof Q->path, "%s", want);
+    FILE *f = fopen(Q->path, "a");
+    if (!f) {
+        /* 目录可能还不存在（首次 serve 早于脚本创建）或只读；按需建一次目录再试 */
+        char dir[256];
+        snprintf(dir, sizeof dir, "%s", Q->path);
+        char *slash = strrchr(dir, '/');
+        if (slash && slash != dir) { *slash = 0; mkdir(dir, 0777); }
+        f = fopen(Q->path, "a");
+    }
+    if (!f) {
+        snprintf(Q->path, sizeof Q->path, "%s", fallback);
+        f = fopen(Q->path, "a");
+        if (f) plog("警告: %s 改写到 %s（%s 打不开）\n", label, Q->path, want);
+    }
+    if (!f) {
+        plog("警告: %s 文件 %s 打不开，本次运行不记录\n", label, want);
+        Q->path[0] = 0;
+        return;
+    }
+    fclose(f);
+
+    qlog_open_append(Q);
+    if (!Q->fp) Q->path[0] = 0;
+    else plog("%s: %s\n", label, Q->path);
 }
 
 static void qlog_open(void)
 {
     qlog_sync_enabled();
-    const char *env = getenv("DNSFW_QLOG");
-    if (env && (!*env || strcasecmp(env, "off") == 0 || strcmp(env, "0") == 0)) return;
-
-    const char *want = (env && *env) ? env : QLOG_PATH;
-    snprintf(g_qlog_path, sizeof g_qlog_path, "%s", want);
-    FILE *f = fopen(g_qlog_path, "a");
-    if (!f) {
-        /* 目录可能还不存在（首次 serve 早于脚本创建）或只读；按需建一次目录再试 */
-        char dir[256];
-        snprintf(dir, sizeof dir, "%s", g_qlog_path);
-        char *slash = strrchr(dir, '/');
-        if (slash && slash != dir) { *slash = 0; mkdir(dir, 0777); }
-        f = fopen(g_qlog_path, "a");
-    }
-    if (!f) {
-        snprintf(g_qlog_path, sizeof g_qlog_path, "%s", QLOG_FALLBACK);
-        f = fopen(g_qlog_path, "a");
-        if (f) plog("警告: 解析记录改写到 %s（%s 打不开）\n", g_qlog_path, want);
-    }
-    if (!f) {
-        plog("警告: 解析记录文件 %s 打不开，本次运行不记录域名\n", want);
-        return;
-    }
-    fclose(f);
-
-    qlog_compact();
-
-    g_qlog = fopen(g_qlog_path, "a");
-    if (!g_qlog) {
-        plog("警告: 解析记录 %s 打不开，本次运行不记录域名\n", g_qlog_path);
-        return;
-    }
-    fseek(g_qlog, 0, SEEK_END);
-    long sz = ftell(g_qlog);
-    g_qlog_bytes = sz > 0 ? sz : 0;
-    if (g_qlog_bytes == 0) {
-        fputs(QLOG_HEADER, g_qlog);
-        fflush(g_qlog);
-        g_qlog_bytes = ftell(g_qlog);
-    }
-    plog("解析记录: %s\n", g_qlog_path);
+    qlog_open_one(&g_qlog, "DNSFW_QLOG", QLOG_PATH, QLOG_FALLBACK, QLOG_HEADER, "解析记录");
+    qlog_open_one(&g_blog, "DNSFW_BLOG", BLOG_PATH, BLOG_FALLBACK, BLOG_HEADER, "拦截记录");
+    qlog_open_one(&g_rlog, "DNSFW_RLOG", RLOG_PATH, RLOG_FALLBACK, RLOG_HEADER, "实时日志");
 }
 
-static void qlog_write(const char *name)
+/* 实时日志: 每条查询一行、不去重，网页上滚动看最近若干条。
+ * 它不参与重匹配（没有去重集合），超限同样整份截断。 */
+static void rlog_write(const char *name, int blocked)
 {
-    if (!g_qlog || !g_qlog_enabled || !name || !*name) return;
+    if (!g_rlog.fp || !g_qlog_enabled || !name || !*name) return;
+    struct timespec ts;
+    struct tm tm;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(g_rlog.fp, "%02d:%02d:%02d %s %s\n",
+            tm.tm_hour, tm.tm_min, tm.tm_sec, verdict_str(blocked), name);
+    fflush(g_rlog.fp);
+    long pos = ftell(g_rlog.fp);
+    if (pos >= 0) g_rlog.bytes = pos;
+    if (g_rlog.bytes > QLOG_MAX_BYTES) qlog_reset_one(&g_rlog);
+}
+
+static void qlog_write(const char *name, int blocked)
+{
+    if (!g_qlog_enabled || !name || !*name) return;
+    rlog_write(name, blocked);
+
+    qlog_t *Q = blocked ? &g_blog : &g_qlog;
+    if (!Q->fp) return;
     /* 同一域名只写一份；集合满或内存不足时退回逐条追加，宁多写不丢记录 */
-    if (g_qlog_seen.used < QLOG_MAX_DOMAINS && strset_insert(&g_qlog_seen, name) == 0) return;
-    fprintf(g_qlog, "%s\n", name);
-    fflush(g_qlog);
-    long pos = ftell(g_qlog);
-    if (pos >= 0) g_qlog_bytes = pos;
-    if (g_qlog_bytes > QLOG_MAX_BYTES) qlog_reset();
+    if (Q->seen.used < QLOG_MAX_DOMAINS && strset_insert(&Q->seen, name) == 0) return;
+    fprintf(Q->fp, "%s\n", name);
+    fflush(Q->fp);
+    long pos = ftell(Q->fp);
+    if (pos >= 0) Q->bytes = pos;
+    if (Q->bytes > QLOG_MAX_BYTES) qlog_reset_one(Q);
 }
 
 /* ---------------- 域名归一化与通配符 ---------------- */
@@ -562,6 +599,111 @@ static int filter_pipeline(const dlist_t *black, const dlist_t *white, const cha
     return 1;
 }
 
+/* ---------------- 日志重匹配（名单一变就把域名搬对地方） ----------------
+ * 目的: 两份去重日志始终符合当前名单。新命中黑名单的从解析日志搬进拦截日志；
+ * 解除拦截（删黑名单条目、把域名加进白名单）的从拦截日志搬回解析日志。
+ * 触发点: 配置重载之后、启动时各一次。
+ * 名单只由配置监听线程改（reload_conf 里整表替换），这里故意不持 g_conf_lock，
+ * 免得重扫期间把 DNS 查询挡住；主线程对这两张表只读。 */
+
+/* 以追加方式打开目标文件，空文件补表头；失败返回 NULL */
+static FILE *qlog_open_dst(const char *path, const char *hdr)
+{
+    FILE *f = fopen(path, "a");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fputs(hdr, f);
+    return f;
+}
+
+/* 把 src 里的域名分成两拨: 该留在本文件的写进 tmp，该搬到另一份的追加进 dst。
+ *   is_block_src=1 表示 src 是拦截日志: 命中黑名单的留下，其余搬走
+ *   keep_seen  顺便完成文件内去重，并记下最终留在本文件的域名
+ *   dst_seen   对方文件已有的域名，已经在里面的不再重复追加
+ * 返回 1 成功（tmp 可以 rename 覆盖原文件），0 失败（调用方不许动原文件）。 */
+static int qlog_partition(const char *src, const char *tmp, const char *hdr,
+                          int is_block_src, FILE *dst, strset_t *dst_seen,
+                          strset_t *keep_seen, size_t *moved)
+{
+    FILE *in = fopen(src, "r");
+    if (!in) return 0;
+    FILE *out = fopen(tmp, "w");
+    if (!out) { fclose(in); return 0; }
+    fputs(hdr, out);
+
+    char line[512];
+    int bad = 0;
+    while (fgets(line, sizeof line, in)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t n = strlen(p);
+        while (n && (p[n-1] == '\n' || p[n-1] == '\r')) p[--n] = 0;
+        if (!*p || *p == '#') continue;
+        char name[256];
+        snprintf(name, sizeof name, "%s", p);
+        if (!*normalize_domain(name)) continue;       /* 历史文件里的大小写/尾点在这里归一 */
+
+        if (filter_pipeline(&g_black, &g_white, name, NULL, NULL) == is_block_src) {
+            if (keep_seen->used < QLOG_MAX_DOMAINS && strset_insert(keep_seen, name) == 0)
+                continue;                             /* 同一文件里的重复行 */
+            fprintf(out, "%s\n", name);
+        } else if (dst_seen->used >= QLOG_MAX_DOMAINS || strset_insert(dst_seen, name) != 0) {
+            fprintf(dst, "%s\n", name);
+            if (moved) (*moved)++;
+        }
+    }
+    if (ferror(in) || ferror(out)) bad = 1;
+    fclose(in);
+    if (fclose(out) != 0) bad = 1;
+    if (bad) { unlink(tmp); return 0; }
+    return 1;
+}
+
+static void qlog_reconcile(void)
+{
+    if (!g_qlog_enabled) return;                       /* 记录关着就不折腾 */
+    if (!g_qlog.fp || !g_blog.fp) return;              /* 有一份没开起来就不同步，免得搬出半套状态 */
+
+    size_t moved_out = 0, moved_back = 0;
+    char tmp[300];
+
+    /* 重写前先放开句柄: 下面要 rename 覆盖同一个路径 */
+    fclose(g_qlog.fp); g_qlog.fp = NULL;
+    fclose(g_blog.fp); g_blog.fp = NULL;
+
+    /* 1) 拦截日志 -> 不再命中的搬回解析日志 */
+    FILE *q = qlog_open_dst(g_qlog.path, QLOG_HEADER);
+    if (q) {
+        strset_free(&g_blog.seen);
+        strset_init(&g_blog.seen);
+        snprintf(tmp, sizeof tmp, "%s.tmp", g_blog.path);
+        if (qlog_partition(g_blog.path, tmp, BLOG_HEADER, 1, q, &g_qlog.seen,
+                           &g_blog.seen, &moved_back)) {
+            if (rename(tmp, g_blog.path) != 0) unlink(tmp);
+        }
+        fclose(q);
+    }
+
+    /* 2) 解析日志 -> 新命中的搬进拦截日志。
+       上一步追加到解析日志的行此时已经落盘，这里读到的是最终内容 */
+    FILE *b = qlog_open_dst(g_blog.path, BLOG_HEADER);
+    if (b) {
+        strset_free(&g_qlog.seen);
+        strset_init(&g_qlog.seen);
+        snprintf(tmp, sizeof tmp, "%s.tmp", g_qlog.path);
+        if (qlog_partition(g_qlog.path, tmp, QLOG_HEADER, 0, b, &g_blog.seen,
+                           &g_qlog.seen, &moved_out)) {
+            if (rename(tmp, g_qlog.path) != 0) unlink(tmp);
+        }
+        fclose(b);
+    }
+
+    qlog_open_append(&g_qlog);                         /* 重新挂上句柄，顺带刷新字节数 */
+    qlog_open_append(&g_blog);
+    if (moved_out || moved_back)
+        plog("日志重匹配: %zu 条移入拦截记录, %zu 条移回解析记录\n", moved_out, moved_back);
+}
+
 /* ---------------- 上游管理 ---------------- */
 
 typedef struct {
@@ -662,7 +804,7 @@ static void reload_conf(const char *dir)
 
     int qlog_was = g_qlog_enabled;
     qlog_sync_enabled();
-    if (qlog_was != g_qlog_enabled) plog("解析记录已%s\n", g_qlog_enabled ? "开启" : "关闭");
+    if (qlog_was != g_qlog_enabled) plog("记录功能已%s\n", g_qlog_enabled ? "开启" : "关闭");
     dlist_init(&nb);
     dlist_init(&nw);
 
@@ -689,6 +831,9 @@ static void reload_conf(const char *dir)
     if (w < 0) dlist_free(&nw);
     if (u <= 0) plog("警告: 上游配置没有可用条目，保留原来的 %d 个\n", oldu);
     plog("配置已重载: 黑名单 %d 条, 白名单 %d 条, 上游 %d 个\n", beff, weff, ueff);
+
+    /* 名单变了就把两份去重日志按新名单重新分拣（放在表替换之后，不持锁） */
+    qlog_reconcile();
 }
 
 static int ev_interesting(const char *name)
@@ -786,9 +931,8 @@ static char dns_byte(unsigned char c)
     return (c >= 0x21 && c <= 0x7e) ? (char)c : '?';
 }
 
-/* 提取查询包第一个问题的域名与 QTYPE; 域名成功返回其长度, 失败 -1。
- * *qtype_out 可为 NULL。QTYPE/QCLASS 页脚除了判「问题段是否完整」，
- * QTYPE 还决定拦截时回 A 记录还是回 NXDOMAIN */
+/* 提取查询包第一个问题的域名（可选带回 QTYPE）; 成功返回其长度, 失败 -1。
+ * *qtype_out 可为 NULL。QTYPE/QCLASS 页脚用于判「问题段是否完整」 */
 static int parse_qname(const uint8_t *pkt, size_t len, char *out, size_t outsz, int *qtype_out)
 {
     if (len < 13) return -1;
@@ -846,26 +990,6 @@ terminated:
     return (int)base;
 }
 
-/* 黑名单命中的 A 查询: 在 build_response 的空应答后面挂一条 A 记录。
- * 问题段固定在应答偏移 12，所以答案名字用压缩指针 0xC00C 就够了。
- * 成功返回总长, 失败 -1（调用方退回 NXDOMAIN） */
-static int build_block_a(const uint8_t *pkt, size_t plen,
-                         uint8_t *resp, size_t respsz)
-{
-    int base = build_response(pkt, plen, resp, respsz, RCODE_NOERROR);
-    if (base < 0 || (size_t)base + BLOCK_ANSWER_BYTES > respsz) return -1;
-    uint8_t *rr = resp + base;
-    rr[0] = 0xC0; rr[1] = 0x0C;                    /* NAME: 指向问题段的名字 */
-    rr[2] = 0;    rr[3] = QTYPE_A;                 /* TYPE: A */
-    rr[4] = 0;    rr[5] = 1;                       /* CLASS: IN */
-    rr[6] = 0;    rr[7] = 0;  rr[8] = 0;  rr[9] = BLOCK_A_TTL;
-    rr[10] = 0;   rr[11] = 4;                      /* RDLENGTH: 4 */
-    rr[12] = BLOCK_A[0]; rr[13] = BLOCK_A[1];
-    rr[14] = BLOCK_A[2]; rr[15] = BLOCK_A[3];
-    resp[6] = 0; resp[7] = 1;                      /* ANCOUNT: 1 */
-    return base + BLOCK_ANSWER_BYTES;
-}
-
 /* 地址+端口是否同一个：上游 socket 不 connect，应答来源只能自己比 */
 static int same_addr(const struct sockaddr *a, const struct sockaddr *b)
 {
@@ -902,7 +1026,7 @@ static int        g_lfd[2];
 static int        g_nlisten;
 
 static uint8_t qbuf[MAX_RECV];
-static uint8_t rbuf[MAX_RECV + BLOCK_ANSWER_BYTES];   /* 拦截应答比查询多一条 A 记录 */
+static uint8_t rbuf[MAX_RECV];
 static uint8_t abuf[MAX_RECV];
 
 /* 从收到查询的那个监听套接字回包（家族必须与客户端一致，否则 IPv6 查询收不到应答） */
@@ -1028,7 +1152,7 @@ static void slot_failover(int i)
     pthread_mutex_unlock(&g_conf_lock);
     int rl = build_response(S->pkt, S->plen, rbuf, sizeof rbuf, RCODE_SERVFAIL);
     send_reply(S->lfd_idx, rbuf, rl, (const struct sockaddr *)&S->cli, S->cli_len, "SERVFAIL");
-    qlog_write(S->name);
+    qlog_write(S->name, 0);
     slot_close(i);
 }
 
@@ -1103,6 +1227,7 @@ static int run_server(void)
     plog("黑名单 %d 条, 白名单 %d 条, 上游 %d 个%s\n", nb, nw, g_nu,
          g_nu ? "" : "（无，透传将全部 SERVFAIL）");
     qlog_open();
+    qlog_reconcile();     /* 上次退出时的名单与现在可能不同，先按当前名单分拣一遍 */
 
     /* 配置监听线程: 文件保存后自动重载，不需要重启服务 */
     char *wdir = strdup(confdir);
@@ -1146,8 +1271,7 @@ static int run_server(void)
                 if ((size_t)n < 12) continue;                    /* 太短，丢弃 */
 
                 char name[256];
-                int qtype = 0;
-                if (parse_qname(qbuf, (size_t)n, name, sizeof name, &qtype) < 0) {
+                if (parse_qname(qbuf, (size_t)n, name, sizeof name, NULL) < 0) {
                     int rl = build_response(qbuf, (size_t)n, rbuf, sizeof rbuf, RCODE_SERVFAIL);
                     if (rl > 0) {
                         send_reply(li, rbuf, rl, (struct sockaddr *)&cli, clen, "SERVFAIL");
@@ -1164,17 +1288,12 @@ static int run_server(void)
                 int blocked = filter_pipeline(&g_black, &g_white, name, NULL, NULL);
                 pthread_mutex_unlock(&g_conf_lock);
                 if (blocked) {
-                    /* 拦截: A 查询回本地 Sink v4 地址，其它类型回 NXDOMAIN，完全不碰上游 */
+                    /* 拦截: 一律回 NXDOMAIN（含 A），不给 sinkhole 地址，完全不碰上游。
+                       回"域名不存在"让客户端直接放弃，避免连 127.0.0.1 被拒后高频重试 */
                     plog("query %-40s -> %s\n", name, verdict_str(1));
-                    qlog_write(name);
-                    const char *tag = "NXDOMAIN";
-                    int rl = -1;
-                    if (qtype == QTYPE_A) {
-                        rl = build_block_a(qbuf, (size_t)n, rbuf, sizeof rbuf);
-                        if (rl > 0) tag = "A-Sink";
-                    }
-                    if (rl < 0) rl = build_response(qbuf, (size_t)n, rbuf, sizeof rbuf, RCODE_NXDOMAIN);
-                    send_reply(li, rbuf, rl, (struct sockaddr *)&cli, clen, tag);
+                    qlog_write(name, 1);
+                    int rl = build_response(qbuf, (size_t)n, rbuf, sizeof rbuf, RCODE_NXDOMAIN);
+                    send_reply(li, rbuf, rl, (struct sockaddr *)&cli, clen, "NXDOMAIN");
                     continue;
                 }
                 plog("query %-40s -> %s\n", name, verdict_str(0));
@@ -1183,7 +1302,7 @@ static int run_server(void)
                     int rl = build_response(qbuf, (size_t)n, rbuf, sizeof rbuf, RCODE_SERVFAIL);
                     send_reply(li, rbuf, rl, (struct sockaddr *)&cli, clen, "SERVFAIL");
                     plog("查询超过 %d 字节，不转发\n", MAX_QUERY_STORE);
-                    qlog_write(name);
+                    qlog_write(name, 0);
                     continue;
                 }
                 /* 透传: 开一个在途槽等上游 */
@@ -1191,7 +1310,7 @@ static int run_server(void)
                     int rl = build_response(qbuf, (size_t)n, rbuf, sizeof rbuf, RCODE_SERVFAIL);
                     send_reply(li, rbuf, rl, (struct sockaddr *)&cli, clen, "SERVFAIL");
                     plog("无可用上游或并发已满, SERVFAIL\n");
-                    qlog_write(name);
+                    qlog_write(name, 0);
                 }
             }
         }
@@ -1251,7 +1370,7 @@ static int run_server(void)
                 pthread_mutex_unlock(&g_conf_lock);
                 send_reply(S->lfd_idx, abuf, (int)rn,
                            (const struct sockaddr *)&S->cli, S->cli_len, "透传应答");
-                qlog_write(S->name);
+                qlog_write(S->name, 0);
                 slot_close(i);
             }
         }
@@ -1265,7 +1384,9 @@ static int run_server(void)
 
     for (int li = 0; li < g_nlisten; li++) close(g_lfd[li]);
     for (int i = 0; i < MAX_INFLIGHT; i++) slot_close(i);
-    if (g_qlog) { fclose(g_qlog); g_qlog = NULL; }
+    if (g_qlog.fp) { fclose(g_qlog.fp); g_qlog.fp = NULL; }
+    if (g_blog.fp) { fclose(g_blog.fp); g_blog.fp = NULL; }
+    if (g_rlog.fp) { fclose(g_rlog.fp); g_rlog.fp = NULL; }
     pthread_mutex_lock(&g_conf_lock);
     dlist_free(&g_black);
     dlist_free(&g_white);
